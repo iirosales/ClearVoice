@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClearVoice for YouTube</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <header class="header">
+        <div class="brand">
+          <span class="brand-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20">
+              <rect x="3.5" y="9.5" width="2.4" height="5" rx="1.2" fill="currentColor"></rect>
+              <rect x="8.2" y="5" width="2.4" height="14" rx="1.2" fill="currentColor"></rect>
+              <rect x="13" y="7" width="2.4" height="10" rx="1.2" fill="currentColor"></rect>
+              <rect x="17.8" y="9" width="2.4" height="6" rx="1.2" fill="currentColor"></rect>
+            </svg>
+          </span>
+          <div>
+            <h1>ClearVoice</h1>
+            <p class="subtitle">Local AI Speech Clarity</p>
+          </div>
+        </div>
+        <label class="switch" aria-label="Toggle ClearVoice">
+          <input type="checkbox" id="toggle-enabled" />
+          <span class="slider"></span>
+        </label>
+      </header>
+
+      <section class="card">
+        <div class="row">
+          <span class="label">Voice Preset</span>
+          <span class="tag">Kokoro-82M</span>
+        </div>
+        <select id="voice-select" class="select">
+          <option value="af_heart">Heart (US Female · Natural)</option>
+          <option value="af_bella">Bella (US Female · Crisp)</option>
+          <option value="am_adam">Adam (US Male · Neutral)</option>
+          <option value="am_michael">Michael (US Male · Warm)</option>
+          <option value="bf_emma">Emma (UK Female · Clear)</option>
+          <option value="bm_george">George (UK Male · Studio)</option>
+        </select>
+      </section>
+
+      <section class="card">
+        <div class="row">
+          <span class="label">Local Engine</span>
+          <span id="status-badge" class="badge badge-idle">Standby</span>
+        </div>
+        <p id="status-detail" class="detail">
+          100% local in-browser synthesis. No external APIs or keys.
+        </p>
+        <button id="preload-btn" class="btn" type="button">Preload Kokoro Model</button>
+      </section>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

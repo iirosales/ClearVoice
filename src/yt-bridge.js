@@ -7,6 +7,7 @@
 
   const cachedSignedUrls = new Map();
   const cachedJson3ByVideo = new Map();
+  const lastResultByVideo = new Map();
 
   let currentExtractionToken = 0;
   let lastDispatchedKey = '';
@@ -26,6 +27,9 @@
   }
 
   function postToContent(payload) {
+    if (payload.type === 'CV_CAPTIONS_RESULT' && payload.videoId) {
+      lastResultByVideo.set(payload.videoId, payload);
+    }
     window.postMessage(
       {
         source: BRIDGE_SOURCE,
@@ -268,6 +272,11 @@
     if (!msg || msg.source !== CONTENT_SOURCE) return;
 
     if (msg.type === 'CV_REQUEST_CAPTIONS') {
+      const videoId = getCurrentVideoId();
+      if (!msg.force && videoId && lastResultByVideo.has(videoId)) {
+        postToContent(lastResultByVideo.get(videoId));
+        return;
+      }
       extractAndPublishCaptions({ force: Boolean(msg.force) });
     }
   });
