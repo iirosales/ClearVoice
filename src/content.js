@@ -75,7 +75,7 @@ import { UIInjector } from './ui-injector.js';
 
   const scheduler = new AudioScheduler({
     getVoice: () => prefs.voice || 'af_heart',
-    synthesizeCue: async ({ text, voice, epoch }) => {
+    synthesizeCue: async ({ text, voice, epoch, priority }) => {
       try {
         return await chrome.runtime.sendMessage({
           target: 'background',
@@ -83,6 +83,7 @@ import { UIInjector } from './ui-injector.js';
           text,
           voice,
           epoch,
+          priority,
         });
       } catch (err) {
         return { ok: false, status: 'error', error: err?.message || String(err) };
@@ -94,6 +95,25 @@ import { UIInjector } from './ui-injector.js';
           target: 'background',
           type: 'CV_CANCEL_EPOCH',
           epoch,
+        })
+        .catch(() => {});
+    },
+    playOffscreenAudio: ({ wavBase64, playbackRate, epoch }) => {
+      chrome.runtime
+        .sendMessage({
+          target: 'background',
+          type: 'CV_PLAY_OFFSCREEN_AUDIO',
+          wavBase64,
+          playbackRate,
+          epoch,
+        })
+        .catch(() => {});
+    },
+    stopOffscreenAudio: () => {
+      chrome.runtime
+        .sendMessage({
+          target: 'background',
+          type: 'CV_STOP_OFFSCREEN_AUDIO',
         })
         .catch(() => {});
     },
@@ -375,6 +395,15 @@ import { UIInjector } from './ui-injector.js';
     } catch {
       // Background worker starts on demand
     }
+
+    window.addEventListener('pointerdown', () => scheduler.unlockAudioContext(), {
+      capture: true,
+      passive: true,
+    });
+    window.addEventListener('keydown', () => scheduler.unlockAudioContext(), {
+      capture: true,
+      passive: true,
+    });
 
     observeMoviePlayer();
     ui.inject();

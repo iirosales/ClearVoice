@@ -4,8 +4,11 @@
 
   const BRIDGE_SOURCE = 'clearvoice-bridge';
   const CONTENT_SOURCE = 'clearvoice-content';
+  const STEALTH_STYLE_ID = 'clearvoice-stealth-style';
+  const STEALTH_CLASS = 'cv-stealth-captions';
 
   const cachedSignedUrls = new Map();
+  const cachedPotByVideo = new Map();
   const cachedJson3ByVideo = new Map();
   const lastResultByVideo = new Map();
 
@@ -24,6 +27,19 @@
     if (liveMatch) return liveMatch[1];
 
     return null;
+  }
+
+  function ensureStealthStyle() {
+    if (document.getElementById(STEALTH_STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = STEALTH_STYLE_ID;
+    style.textContent = `
+      html.${STEALTH_CLASS} #movie_player .ytp-caption-window-container {
+        opacity: 0 !important;
+        pointer-events: none !important;
+      }
+    `;
+    (document.head || document.documentElement)?.appendChild(style);
   }
 
   function postToContent(payload) {
@@ -45,42 +61,105 @@
     );
   }
 
+  function buildSignedTrackUrl(trackUrl, videoId) {
+    const url = new URL(trackUrl, window.location.origin);
+    url.searchParams.set('fmt', 'json3');
+    const potMeta = cachedPotByVideo.get(videoId);
+    if (potMeta?.pot && !url.searchParams.get('pot')) {
+      url.searchParams.set('pot', potMeta.pot);
+      if (potMeta.c && !url.searchParams.get('c')) {
+        url.searchParams.set('c', potMeta.c);
+      }
+      if (potMeta.cver && !url.searchParams.get('cver')) {
+        url.searchParams.set('cver', potMeta.cver);
+      }
+    }
+    return url.toString();
+  }
+
   function captureTimedtextUrl(rawUrl, jsonPayload) {
     try {
       const parsed = new URL(rawUrl, window.location.origin);
       if (!parsed.pathname.includes('/api/timedtext')) return;
       const v = parsed.searchParams.get('v') || getCurrentVideoId();
+      if (!v) return;
+
+      const pot = parsed.searchParams.get('pot');
+      if (pot) {
+        cachedPotByVideo.set(v, {
+          pot,
+          c: parsed.searchParams.get('c') || '',
+          cver: parsed.searchParams.get('cver') || '',
+        });
+      }
+
       const lang = parsed.searchParams.get('lang') || '';
-      if (!v || !/^en(?:-|$)/i.test(lang)) return;
+      if (!/^en(?:-|$)/i.test(lang)) return;
 
       parsed.searchParams.set('fmt', 'json3');
-      cachedSignedUrls.set(v, parsed.toString());
+      const signedUrl = parsed.toString();
+      cachedSignedUrls.set(v, signedUrl);
 
-      if (jsonPayload && Array.isArray(jsonPayload.events)) {
+      const trackKind = parsed.searchParams.get('kind') === 'asr' ? 'asr' : 'manual';
+
+      if (jsonPayload && Array.isArray(jsonPayload.events) && jsonPayload.events.length > 0) {
         cachedJson3ByVideo.set(v, {
           events: jsonPayload.events,
           languageCode: lang,
-          trackKind: parsed.searchParams.get('kind') === 'asr' ? 'asr' : 'manual',
+          trackKind,
         });
+
+        if (v === getCurrentVideoId() && !lastResultByVideo.has(v)) {
+          lastDispatchedKey = `${v}:${lang}:${trackKind}`;
+          postToContent({
+            type: 'CV_CAPTIONS_RESULT',
+            available: true,
+            videoId: v,
+            trackKind,
+            languageCode: lang,
+            events: jsonPayload.events,
+          });
+        }
+      } else if (pot && v === getCurrentVideoId() && !lastResultByVideo.has(v)) {
+        // Player requested srv3/vtt with pot; fetch json3 using the signed URL immediately
+        fetchJson3Events(signedUrl)
+          .then((events) => {
+            if (events.length > 0 && v === getCurrentVideoId() && !lastResultByVideo.has(v)) {
+              cachedJson3ByVideo.set(v, {
+                events,
+                languageCode: lang,
+                trackKind,
+              });
+              lastDispatchedKey = `${v}:${lang}:${trackKind}`;
+              postToContent({
+                type: 'CV_CAPTIONS_RESULT',
+                available: true,
+                videoId: v,
+                trackKind,
+                languageCode: lang,
+                events,
+              });
+            }
+          })
+          .catch(() => {});
       }
     } catch {
       // Ignore malformed URLs
     }
   }
 
-  // Intercept fetch & XHR for /api/timedtext to reuse signed player URLs if present
+  // Intercept fetch & XHR for /api/timedtext to capture signed URLs and pot tokens
   const originalFetch = window.fetch;
   if (typeof originalFetch === 'function') {
-    window.fetch = async function wrappedFetch(input, init) {
+    window.fetch = async function wrappedFetch(input) {
       const urlStr = typeof input === 'string' ? input : input?.url || '';
       const response = await originalFetch.apply(this, arguments);
       if (urlStr.includes('/api/timedtext')) {
         try {
           const clone = response.clone();
           const text = await clone.text();
-          if (text) {
-            const parsed = JSON.parse(text);
-            captureTimedtextUrl(urlStr, parsed);
+          if (text && text.trim().startsWith('{')) {
+            captureTimedtextUrl(urlStr, JSON.parse(text));
           } else {
             captureTimedtextUrl(urlStr, null);
           }
@@ -94,7 +173,7 @@
 
   const origXhrOpen = XMLHttpRequest.prototype.open;
   const origXhrSend = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.open = function wrappedOpen(method, url) {
+  XMLHttpRequest.prototype.open = function wrappedOpen(_method, url) {
     this.__cvUrl = typeof url === 'string' ? url : '';
     return origXhrOpen.apply(this, arguments);
   };
@@ -102,12 +181,17 @@
     if (this.__cvUrl && this.__cvUrl.includes('/api/timedtext')) {
       this.addEventListener('load', () => {
         try {
-          const text = typeof this.responseText === 'string' ? this.responseText : '';
-          if (text) {
-            captureTimedtextUrl(this.__cvUrl, JSON.parse(text));
-          } else {
-            captureTimedtextUrl(this.__cvUrl, null);
+          let parsed = null;
+          if (this.responseType === 'json' && this.response) {
+            parsed = this.response;
+          } else if (
+            (!this.responseType || this.responseType === 'text') &&
+            typeof this.responseText === 'string' &&
+            this.responseText.trim().startsWith('{')
+          ) {
+            parsed = JSON.parse(this.responseText);
           }
+          captureTimedtextUrl(this.__cvUrl, parsed);
         } catch {
           captureTimedtextUrl(this.__cvUrl, null);
         }
@@ -203,6 +287,72 @@
     return getPlayerResponseForVideo(videoId) || bestResp;
   }
 
+  async function pollForSignedCaption(videoId, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (getCurrentVideoId() !== videoId) return false;
+      if (
+        cachedSignedUrls.has(videoId) ||
+        cachedPotByVideo.has(videoId) ||
+        cachedJson3ByVideo.has(videoId)
+      ) {
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    }
+    return false;
+  }
+
+  /**
+   * When YouTube enforces POT (exp=xpe) on /api/timedtext, direct fetches return 0 bytes
+   * until #movie_player triggers a caption request with its Proof-of-Origin token.
+   */
+  async function triggerPlayerTimedtextFetch(videoId, selectedTrack) {
+    const player = document.querySelector('#movie_player');
+    if (!player) return false;
+
+    ensureStealthStyle();
+    document.documentElement.classList.add(STEALTH_CLASS);
+
+    try {
+      try {
+        player.loadModule?.('captions');
+        player.setOption?.('captions', 'track', {
+          languageCode: selectedTrack.languageCode || 'en',
+          kind: selectedTrack.kind || '',
+        });
+      } catch {
+        // Ignore if player captions module API is restricted
+      }
+
+      if (await pollForSignedCaption(videoId, 600)) {
+        return true;
+      }
+
+      const subBtn = player.querySelector('.ytp-subtitles-button');
+      if (!subBtn) return false;
+
+      const wasPressed = subBtn.getAttribute('aria-pressed') === 'true';
+      if (!wasPressed) {
+        subBtn.click();
+        const gotToken = await pollForSignedCaption(videoId, 1800);
+        if (subBtn.getAttribute('aria-pressed') === 'true') {
+          subBtn.click();
+        }
+        return gotToken;
+      }
+
+      subBtn.click();
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      subBtn.click();
+      return await pollForSignedCaption(videoId, 1800);
+    } finally {
+      setTimeout(() => {
+        document.documentElement.classList.remove(STEALTH_CLASS);
+      }, 150);
+    }
+  }
+
   async function extractAndPublishCaptions({ force = false } = {}) {
     const videoId = getCurrentVideoId();
     if (!videoId) return;
@@ -245,9 +395,31 @@
     if (!force && dispatchKey === lastDispatchedKey) return;
 
     try {
-      let events = await fetchJson3Events(selectedTrack.baseUrl);
+      const initialUrl = buildSignedTrackUrl(selectedTrack.baseUrl, videoId);
+      let events = await fetchJson3Events(initialUrl);
+
       if (events.length === 0 && cachedSignedUrls.has(videoId)) {
         events = await fetchJson3Events(cachedSignedUrls.get(videoId));
+      }
+
+      if (events.length === 0) {
+        const alreadyPublishedBeforeTrigger = lastResultByVideo.has(videoId);
+        await triggerPlayerTimedtextFetch(videoId, selectedTrack);
+        if (token !== currentExtractionToken || getCurrentVideoId() !== videoId) return;
+
+        // If captureTimedtextUrl already pushed fresh captions to content.js during trigger, avoid duplicate reset
+        if (!alreadyPublishedBeforeTrigger && lastResultByVideo.has(videoId)) {
+          return;
+        }
+
+        const liveCached = cachedJson3ByVideo.get(videoId);
+        if (liveCached && liveCached.events.length > 0) {
+          events = liveCached.events;
+        } else {
+          const signedUrl =
+            cachedSignedUrls.get(videoId) || buildSignedTrackUrl(selectedTrack.baseUrl, videoId);
+          events = await fetchJson3Events(signedUrl);
+        }
       }
 
       if (token !== currentExtractionToken || getCurrentVideoId() !== videoId) return;

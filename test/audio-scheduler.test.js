@@ -8,6 +8,18 @@ function createFakeVideo(initialTime = 0, playbackRate = 1) {
     currentTime: initialTime,
     playbackRate,
     paused: false,
+    pauseCalls: 0,
+    playCalls: 0,
+    pause() {
+      this.pauseCalls += 1;
+      this.paused = true;
+      this.emit('pause');
+    },
+    async play() {
+      this.playCalls += 1;
+      this.paused = false;
+      this.emit('play');
+    },
     addEventListener(name, fn) {
       if (!listeners.has(name)) listeners.set(name, []);
       listeners.get(name).push(fn);
@@ -265,6 +277,88 @@ test('AudioScheduler switches Kokoro voice immediately via setVoice and updates 
 
   video.emit('pause');
   assert.equal(audioCtx.suspendedCount, 1);
+
+  scheduler.destroy();
+});
+
+test('AudioScheduler pauses video to buffer pending Kokoro cue with high priority and resumes cleanly', async () => {
+  const video = createFakeVideo(0.1, 1.0);
+  const audioCtx = createFakeAudioContext();
+  const dummyBase64 = Buffer.from('RIFFtest').toString('base64');
+  const seenPriorities = [];
+
+  const scheduler = new AudioScheduler({
+    video,
+    initialModelState: 'ready',
+    createAudioContext: () => audioCtx,
+    speechSynthesis: null,
+    synthesizeCue: async ({ priority }) => {
+      seenPriorities.push(priority);
+      await new Promise((r) => setTimeout(r, 30));
+      return {
+        ok: true,
+        status: 'ready',
+        wavBase64: dummyBase64,
+        durationSec: 2.0,
+      };
+    },
+  });
+
+  scheduler.setCues([
+    { id: 0, text: 'First buffered cue', startSec: 0, endSec: 2.0, durationSec: 2.0 },
+    { id: 1, text: 'Second lookahead cue', startSec: 2.5, endSec: 4.5, durationSec: 2.0 },
+  ]);
+  scheduler.start();
+
+  // Video should pause immediately while cue 0 is pending, without suspending AudioContext
+  assert.equal(video.pauseCalls, 1);
+  assert.equal(video.paused, true);
+  assert.equal(audioCtx.suspendedCount, 0);
+  assert.equal(seenPriorities[0], 'high');
+  assert.equal(seenPriorities[1], 'normal');
+
+  await new Promise((r) => setTimeout(r, 50));
+
+  assert.equal(video.playCalls, 1);
+  assert.equal(video.paused, false);
+  assert.equal(audioCtx.createdSources.length, 1);
+
+  scheduler.destroy();
+});
+
+test('AudioScheduler falls back to offscreen audio when page AudioContext stays suspended', async () => {
+  const video = createFakeVideo(0, 1.0);
+  const audioCtx = createFakeAudioContext();
+  audioCtx.state = 'suspended';
+  audioCtx.resume = async () => {
+    // Simulate Chrome Autoplay Policy keeping AudioContext suspended before user gesture
+    audioCtx.state = 'suspended';
+  };
+
+  const dummyBase64 = Buffer.from('RIFFtest').toString('base64');
+  const offscreenPlayed = [];
+
+  const scheduler = new AudioScheduler({
+    video,
+    initialModelState: 'ready',
+    createAudioContext: () => audioCtx,
+    speechSynthesis: null,
+    playOffscreenAudio: (payload) => offscreenPlayed.push(payload),
+    synthesizeCue: async () => ({
+      ok: true,
+      status: 'ready',
+      wavBase64: dummyBase64,
+      durationSec: 2.0,
+    }),
+  });
+
+  scheduler.setCues([{ id: 0, text: 'Autoplay test', startSec: 0, endSec: 2.0, durationSec: 2.0 }]);
+  scheduler.start();
+
+  await new Promise((r) => setTimeout(r, 220));
+  assert.equal(offscreenPlayed.length, 1);
+  assert.equal(offscreenPlayed[0].wavBase64, dummyBase64);
+  assert.equal(audioCtx.createdSources.length, 0);
 
   scheduler.destroy();
 });

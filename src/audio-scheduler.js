@@ -47,6 +47,8 @@ export class AudioScheduler {
     this.video = options.video || null;
     this.synthesizeCue = options.synthesizeCue;
     this.cancelEpoch = options.cancelEpoch || (() => {});
+    this.playOffscreenAudio = options.playOffscreenAudio || null;
+    this.stopOffscreenAudio = options.stopOffscreenAudio || (() => {});
     this.getVoice = options.getVoice || (() => 'af_heart');
     this.onModelState = options.onModelState || (() => {});
     this.createAudioContext =
@@ -79,6 +81,9 @@ export class AudioScheduler {
     this.epoch = 0;
     this.enabled = false;
     this.adPaused = false;
+    this.bufferingPause = false;
+    this._internalPauseAction = false;
+    this._bufferingCueId = null;
     this.modelState = options.initialModelState || 'idle';
     this.tickTimer = null;
 
@@ -119,6 +124,13 @@ export class AudioScheduler {
     this._boundHandlers = null;
   }
 
+  unlockAudioContext() {
+    if (!this.audioCtx) return;
+    if (this.audioCtx.state === 'suspended') {
+      this.audioCtx.resume().catch(() => {});
+    }
+  }
+
   _ensureAudioContext() {
     if (!this.audioCtx) {
       this.audioCtx = this.createAudioContext();
@@ -130,6 +142,9 @@ export class AudioScheduler {
   }
 
   setCues(cues) {
+    this.bufferingPause = false;
+    this._bufferingCueId = null;
+    this._internalPauseAction = false;
     this.stopActiveAudio();
     this.epoch += 1;
     this.cancelEpoch(this.epoch);
@@ -158,6 +173,9 @@ export class AudioScheduler {
 
   stop() {
     this.enabled = false;
+    this.bufferingPause = false;
+    this._bufferingCueId = null;
+    this._internalPauseAction = false;
     if (this.tickTimer) {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
@@ -178,6 +196,9 @@ export class AudioScheduler {
     this.adPaused = next;
 
     if (next) {
+      this.bufferingPause = false;
+      this._bufferingCueId = null;
+      this._internalPauseAction = false;
       this.stopActiveAudio();
       if (this.audioCtx && this.audioCtx.state === 'running') {
         this.audioCtx.suspend().catch(() => {});
@@ -256,9 +277,13 @@ export class AudioScheduler {
     if (this.speechSynthesis && typeof this.speechSynthesis.cancel === 'function') {
       this.speechSynthesis.cancel();
     }
+    this.stopOffscreenAudio();
   }
 
   handleSeek() {
+    this.bufferingPause = false;
+    this._bufferingCueId = null;
+    this._internalPauseAction = false;
     this.epoch += 1;
     this.stopActiveAudio();
     this.playedCueIds.clear();
@@ -279,6 +304,7 @@ export class AudioScheduler {
 
   _handlePlay() {
     if (!this.enabled || this.adPaused) return;
+    this._internalPauseAction = false;
     const ctx = this._ensureAudioContext();
     if (ctx.state === 'suspended') {
       ctx.resume().catch(() => {});
@@ -290,6 +316,13 @@ export class AudioScheduler {
   }
 
   _handlePause() {
+    if (this._internalPauseAction) {
+      this._internalPauseAction = false;
+      return;
+    }
+    this.bufferingPause = false;
+    this._bufferingCueId = null;
+    this.stopOffscreenAudio();
     if (this.audioCtx && this.audioCtx.state === 'running') {
       this.audioCtx.suspend().catch(() => {});
     }
@@ -328,8 +361,15 @@ export class AudioScheduler {
       }
     }
 
-    if (candidate !== -1 && currentTimeSec < this.cues[candidate].endSec) {
-      return candidate;
+    if (candidate !== -1) {
+      const cue = this.cues[candidate];
+      if (currentTimeSec < cue.endSec) {
+        return candidate;
+      }
+      // Allow playing an unplayed cue if the playhead is within 0.6s after its window
+      if (!this.playedCueIds.has(cue.id) && currentTimeSec - cue.endSec <= 0.6) {
+        return candidate;
+      }
     }
     return -1;
   }
@@ -359,7 +399,9 @@ export class AudioScheduler {
     const endIdx = Math.min(this.cues.length, startIdx + LOOKAHEAD_CUES);
 
     for (let i = startIdx; i < endIdx; i++) {
-      this._ensureCueSynthesized(this.cues[i]);
+      this._ensureCueSynthesized(this.cues[i], {
+        priority: i === startIdx ? 'high' : 'normal',
+      });
     }
 
     // Evict stale buffers far behind playhead to keep memory bounded
@@ -370,7 +412,24 @@ export class AudioScheduler {
     }
   }
 
-  async _ensureCueSynthesized(cue) {
+  _resumeAfterBuffering() {
+    if (!this.bufferingPause) return;
+    this.bufferingPause = false;
+    this._bufferingCueId = null;
+    this._internalPauseAction = false;
+    if (this.enabled && !this.adPaused && this.video) {
+      try {
+        const playRes = this.video.play?.();
+        if (playRes && typeof playRes.then === 'function') {
+          playRes.then(() => this.tick()).catch(() => {});
+        }
+      } catch {
+        // Ignore play errors in non-DOM mocks
+      }
+    }
+  }
+
+  async _ensureCueSynthesized(cue, { priority = 'normal' } = {}) {
     if (!cue || !this.synthesizeCue) return null;
     const voice = this.getVoice();
     const existing = this.cueCache.get(cue.id);
@@ -387,6 +446,7 @@ export class AudioScheduler {
           text: cue.text,
           voice,
           epoch: requestEpoch,
+          priority,
         });
 
         if (requestEpoch !== this.epoch) {
@@ -400,6 +460,9 @@ export class AudioScheduler {
             this.onModelState('loading');
             // Do not permanently fail loading cues; allow retry on next lookahead
             this.cueCache.delete(cue.id);
+            if (this.bufferingPause) {
+              this._resumeAfterBuffering();
+            }
             if (this.enabled && !this.adPaused) {
               this.tick();
             }
@@ -407,6 +470,12 @@ export class AudioScheduler {
             this.modelState = 'error';
             this.onModelState('error');
             this.cueCache.set(cue.id, { status: 'failed', voice });
+            if (this.bufferingPause) {
+              this._resumeAfterBuffering();
+            }
+            if (this.enabled && !this.adPaused) {
+              this.tick();
+            }
           } else {
             this.cueCache.delete(cue.id);
           }
@@ -427,9 +496,13 @@ export class AudioScheduler {
           status: 'ready',
           voice,
           audioBuffer,
+          wavBase64: res.wavBase64,
           durationSec: audioBuffer.duration || res.durationSec,
         };
         this.cueCache.set(cue.id, entry);
+        if (this.bufferingPause && (this._bufferingCueId === null || this._bufferingCueId === cue.id)) {
+          this._resumeAfterBuffering();
+        }
         if (this.enabled && !this.adPaused) {
           this.tick();
         }
@@ -437,6 +510,9 @@ export class AudioScheduler {
       } catch {
         if (this.cueCache.get(cue.id)?.voice === voice) {
           this.cueCache.delete(cue.id);
+        }
+        if (this.bufferingPause) {
+          this._resumeAfterBuffering();
         }
         return null;
       }
@@ -446,8 +522,40 @@ export class AudioScheduler {
     return promise;
   }
 
-  _scheduleAudioBuffer(cue, audioBuffer) {
+  _scheduleAudioBuffer(cue, audioBuffer, cached = null) {
     const ctx = this._ensureAudioContext();
+    const scheduleEpoch = this.epoch;
+
+    if (ctx.state === 'suspended') {
+      Promise.race([
+        ctx.resume().catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, 150)),
+      ]).then(() => {
+        if (!this.enabled || this.adPaused || this.epoch !== scheduleEpoch) return;
+        if (ctx.state === 'suspended' && this.playOffscreenAudio && cached?.wavBase64) {
+          const videoRate = this.video?.playbackRate || 1;
+          const currentVideoTime = this.video?.currentTime ?? cue.startSec;
+          const remainingCueSec = Math.min(
+            cue.durationSec,
+            Math.max(0.35, cue.endSec - currentVideoTime)
+          );
+          const ttsRate = calculateTtsPlaybackRate(audioBuffer.duration, remainingCueSec, videoRate);
+          this.playOffscreenAudio({
+            wavBase64: cached.wavBase64,
+            playbackRate: ttsRate,
+            epoch: scheduleEpoch,
+          });
+          return;
+        }
+        this._commitAudioBufferStart(cue, audioBuffer, ctx);
+      });
+      return;
+    }
+
+    this._commitAudioBufferStart(cue, audioBuffer, ctx);
+  }
+
+  _commitAudioBufferStart(cue, audioBuffer, ctx) {
     const now = ctx.currentTime;
     const videoRate = this.video?.playbackRate || 1;
     const currentVideoTime = this.video?.currentTime ?? cue.startSec;
@@ -531,7 +639,7 @@ export class AudioScheduler {
     const currentTimeSec = this.video.currentTime || 0;
     this.prebufferLookahead(currentTimeSec);
 
-    if (this.video.paused) return;
+    if (this.video.paused && !this.bufferingPause) return;
 
     const cueIdx = this.findCueIndexAtTime(currentTimeSec);
     if (cueIdx === -1) return;
@@ -543,24 +651,41 @@ export class AudioScheduler {
     const cached = this.cueCache.get(cue.id);
 
     if (cached && cached.status === 'ready' && cached.voice === voice && cached.audioBuffer) {
+      if (this.bufferingPause) {
+        this._resumeAfterBuffering();
+      }
       this.playedCueIds.add(cue.id);
       if (this.speechSynthesis && typeof this.speechSynthesis.cancel === 'function') {
         this.speechSynthesis.cancel();
         this.scheduledFallbackId = null;
       }
-      this._scheduleAudioBuffer(cue, cached.audioBuffer);
-      return;
-    }
-
-    // Never fall back to system speechSynthesis while Kokoro is ready or synthesizing a pending cue
-    if (this.modelState === 'ready' && (!cached || cached.status === 'pending')) {
+      this._scheduleAudioBuffer(cue, cached.audioBuffer, cached);
       return;
     }
 
     // Use Web Speech API fallback only while Kokoro weights are downloading or on backend error
     if (this.modelState === 'loading' || this.modelState === 'error' || cached?.status === 'failed') {
-      this.playedCueIds.add(cue.id);
-      this._speakFallback(cue);
+      if (this.bufferingPause) {
+        this._resumeAfterBuffering();
+      }
+      if (!this.video.paused) {
+        this.playedCueIds.add(cue.id);
+        this._speakFallback(cue);
+      }
+      return;
+    }
+
+    // Kokoro is ready or initializing: pause video briefly so playhead never outruns WASM synthesis
+    this._ensureCueSynthesized(cue, { priority: 'high' });
+    if (!this.video.paused && !this.bufferingPause) {
+      this.bufferingPause = true;
+      this._bufferingCueId = cue.id;
+      this._internalPauseAction = true;
+      try {
+        this.video.pause?.();
+      } catch {
+        // Ignore mock errors
+      }
     }
   }
 }

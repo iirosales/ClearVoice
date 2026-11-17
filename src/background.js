@@ -116,11 +116,38 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       text: message.text,
       voice: message.voice,
       epoch: message.epoch,
+      priority: message.priority || 'normal',
+      waitForReady: Boolean(message.waitForReady),
     })
       .then(sendResponse)
       .catch((err) => {
         sendResponse({ ok: false, status: 'error', error: err?.message || String(err) });
       });
+    return true;
+  }
+
+  if (message.type === 'CV_PLAY_OFFSCREEN_AUDIO') {
+    sendToOffscreen({
+      type: 'CV_OFFSCREEN_PLAY_AUDIO',
+      wavBase64: message.wavBase64,
+      playbackRate: message.playbackRate,
+      epoch: message.epoch,
+    })
+      .then(sendResponse)
+      .catch((err) => {
+        sendResponse({ ok: false, error: err?.message || String(err) });
+      });
+    return true;
+  }
+
+  if (message.type === 'CV_STOP_OFFSCREEN_AUDIO') {
+    hasOffscreenDocument()
+      .then((exists) => {
+        if (!exists) return { ok: true };
+        return sendToOffscreen({ type: 'CV_OFFSCREEN_STOP_AUDIO' });
+      })
+      .then(sendResponse)
+      .catch(() => sendResponse({ ok: false }));
     return true;
   }
 
