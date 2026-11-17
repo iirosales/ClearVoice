@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 const rootDir = process.cwd();
 const distDir = path.join(rootDir, 'dist');
 
-test('Manifest V3 build output contains all required local bundles and assets', () => {
+test('Manifest V3 build output contains all required local bundles, voices, and assets', () => {
   execFileSync('node', ['build.js'], { cwd: rootDir, stdio: 'pipe' });
 
   const requiredFiles = [
@@ -25,6 +25,12 @@ test('Manifest V3 build output contains all required local bundles and assets', 
     'icons/icon128.png',
     'wasm/ort-wasm-simd-threaded.jsep.mjs',
     'wasm/ort-wasm-simd-threaded.jsep.wasm',
+    'voices/af_heart.bin',
+    'voices/af_bella.bin',
+    'voices/am_adam.bin',
+    'voices/am_michael.bin',
+    'voices/bf_emma.bin',
+    'voices/bm_george.bin',
   ];
 
   for (const rel of requiredFiles) {
@@ -42,6 +48,7 @@ test('Manifest V3 build output contains all required local bundles and assets', 
   assert.equal(manifest.content_scripts[1].world, 'ISOLATED');
   assert.equal(manifest.content_scripts[1].run_at, 'document_idle');
   assert.ok(manifest.content_security_policy.extension_pages.includes("'wasm-unsafe-eval'"));
+  assert.deepEqual(manifest.web_accessible_resources[0].resources, ['wasm/*', 'voices/*']);
 
   const offscreenBundle = fs.readFileSync(path.join(distDir, 'offscreen.js'), 'utf8');
   assert.ok(offscreenBundle.includes('Kokoro-82M-v1.0-ONNX'));

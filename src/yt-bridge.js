@@ -27,7 +27,13 @@
   }
 
   function postToContent(payload) {
-    if (payload.type === 'CV_CAPTIONS_RESULT' && payload.videoId) {
+    if (
+      payload.type === 'CV_CAPTIONS_RESULT' &&
+      payload.videoId &&
+      payload.available === true &&
+      Array.isArray(payload.events) &&
+      payload.events.length > 0
+    ) {
       lastResultByVideo.set(payload.videoId, payload);
     }
     window.postMessage(
@@ -131,13 +137,19 @@
     return englishTracks.slice().sort((a, b) => scoreTrack(b) - scoreTrack(a))[0];
   }
 
+  function hasCaptionTracks(resp) {
+    const tracks = resp?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+    return Array.isArray(tracks) && tracks.length > 0;
+  }
+
   function getPlayerResponseForVideo(videoId) {
+    let playerResp = null;
     const player = document.querySelector('#movie_player');
     if (player && typeof player.getPlayerResponse === 'function') {
       try {
         const resp = player.getPlayerResponse();
-        if (resp && (!resp.videoDetails?.videoId || resp.videoDetails.videoId === videoId)) {
-          return resp;
+        if (resp && resp.videoDetails?.videoId === videoId) {
+          playerResp = resp;
         }
       } catch {
         // Ignore transient player access errors
@@ -145,11 +157,13 @@
     }
 
     const initial = window.ytInitialPlayerResponse;
-    if (initial && (!initial.videoDetails?.videoId || initial.videoDetails.videoId === videoId)) {
-      return initial;
-    }
+    const initialMatches =
+      initial && initial.videoDetails?.videoId === videoId ? initial : null;
 
-    return null;
+    if (playerResp && hasCaptionTracks(playerResp)) return playerResp;
+    if (initialMatches && hasCaptionTracks(initialMatches)) return initialMatches;
+
+    return playerResp || initialMatches || null;
   }
 
   async function fetchJson3Events(trackUrl) {
@@ -172,15 +186,21 @@
     return Array.isArray(data?.events) ? data.events : [];
   }
 
-  async function waitForPlayerResponse(videoId, maxWaitMs = 4000) {
+  async function waitForPlayerResponse(videoId, maxWaitMs = 6000) {
     const start = Date.now();
+    let bestResp = null;
     while (Date.now() - start < maxWaitMs) {
       if (getCurrentVideoId() !== videoId) return null;
       const resp = getPlayerResponseForVideo(videoId);
-      if (resp) return resp;
+      if (resp) {
+        bestResp = resp;
+        if (hasCaptionTracks(resp) || Date.now() - start >= 2500) {
+          return resp;
+        }
+      }
       await new Promise((resolve) => setTimeout(resolve, 150));
     }
-    return getPlayerResponseForVideo(videoId);
+    return getPlayerResponseForVideo(videoId) || bestResp;
   }
 
   async function extractAndPublishCaptions({ force = false } = {}) {
@@ -213,15 +233,11 @@
     const selectedTrack = selectBestEnglishTrack(tracks);
 
     if (!selectedTrack || !selectedTrack.baseUrl) {
-      const dispatchKey = `${videoId}:none`;
-      if (force || dispatchKey !== lastDispatchedKey) {
-        lastDispatchedKey = dispatchKey;
-        postToContent({
-          type: 'CV_CAPTIONS_RESULT',
-          available: false,
-          videoId,
-        });
-      }
+      postToContent({
+        type: 'CV_CAPTIONS_RESULT',
+        available: false,
+        videoId,
+      });
       return;
     }
 
@@ -237,7 +253,6 @@
       if (token !== currentExtractionToken || getCurrentVideoId() !== videoId) return;
 
       if (events.length === 0) {
-        lastDispatchedKey = `${videoId}:empty`;
         postToContent({
           type: 'CV_CAPTIONS_RESULT',
           available: false,

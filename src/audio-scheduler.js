@@ -1,25 +1,33 @@
 const MIN_TTS_RATE = 0.85;
 const MAX_TTS_RATE = 1.45;
+const MAX_CATCHUP_MULTIPLIER = 1.22;
 const LOOKAHEAD_CUES = 4;
 const OVERLAP_GAP_SEC = 0.05;
 const MAX_WAIT_FOR_ACTIVE_SEC = 0.75;
 const TICK_INTERVAL_MS = 100;
 
 /**
- * Compute clamped TTS playbackRate so an audio buffer fits the cue window
- * while respecting YouTube's video.playbackRate.
+ * Compute natural TTS playbackRate: plays at the video's playback speed when audio
+ * fits the cue window, and applies only a gentle speedup when a cue runs long.
  */
 export function calculateTtsPlaybackRate(audioDurationSec, cueDurationSec, videoPlaybackRate = 1) {
-  if (!Number.isFinite(audioDurationSec) || audioDurationSec <= 0) return 1;
-  if (!Number.isFinite(cueDurationSec) || cueDurationSec <= 0) return 1;
-
   const safeVideoRate =
     Number.isFinite(videoPlaybackRate) && videoPlaybackRate > 0 ? videoPlaybackRate : 1;
-  const effectiveWindow = cueDurationSec / safeVideoRate;
-  if (effectiveWindow <= 0) return MAX_TTS_RATE;
+  const baseRate = Math.min(MAX_TTS_RATE, Math.max(MIN_TTS_RATE, safeVideoRate));
 
-  const rawRate = audioDurationSec / effectiveWindow;
-  return Math.min(MAX_TTS_RATE, Math.max(MIN_TTS_RATE, rawRate));
+  if (!Number.isFinite(audioDurationSec) || audioDurationSec <= 0) return baseRate;
+  if (!Number.isFinite(cueDurationSec) || cueDurationSec <= 0) return baseRate;
+
+  const effectiveWindow = cueDurationSec / safeVideoRate;
+  if (effectiveWindow <= 0) return baseRate;
+
+  const neededRate = audioDurationSec / effectiveWindow;
+  if (neededRate <= baseRate) {
+    return baseRate;
+  }
+
+  const maxAllowedRate = Math.min(MAX_TTS_RATE, baseRate * MAX_CATCHUP_MULTIPLIER);
+  return Math.min(maxAllowedRate, neededRate);
 }
 
 export function base64ToArrayBuffer(base64) {
@@ -71,6 +79,7 @@ export class AudioScheduler {
     this.epoch = 0;
     this.enabled = false;
     this.adPaused = false;
+    this.modelState = options.initialModelState || 'idle';
     this.tickTimer = null;
 
     this._boundHandlers = null;
@@ -182,13 +191,38 @@ export class AudioScheduler {
     }
   }
 
-  invalidateVoiceCache() {
+  setModelState(state) {
+    this.modelState = state;
+    if (
+      state === 'ready' &&
+      this.speechSynthesis &&
+      typeof this.speechSynthesis.cancel === 'function'
+    ) {
+      this.speechSynthesis.cancel();
+      this.scheduledFallbackId = null;
+    }
+    if (state === 'ready' && this.enabled && !this.adPaused) {
+      this.tick();
+    }
+  }
+
+  setVoice(_voice) {
     this.epoch += 1;
-    this.cancelEpoch(this.epoch);
+    this.stopActiveAudio();
+    const activeTime = this.video?.currentTime || 0;
+    const activeIdx = this.findCueIndexAtTime(activeTime);
+    if (activeIdx !== -1) {
+      this.playedCueIds.delete(this.cues[activeIdx].id);
+    }
     this.cueCache.clear();
+    this.cancelEpoch(this.epoch);
     if (this.enabled && !this.adPaused) {
       this.tick();
     }
+  }
+
+  invalidateVoiceCache() {
+    this.setVoice();
   }
 
   destroy() {
@@ -362,10 +396,15 @@ export class AudioScheduler {
 
         if (!res || !res.ok) {
           if (res?.status === 'loading') {
+            this.modelState = 'loading';
             this.onModelState('loading');
             // Do not permanently fail loading cues; allow retry on next lookahead
             this.cueCache.delete(cue.id);
+            if (this.enabled && !this.adPaused) {
+              this.tick();
+            }
           } else if (res?.status === 'error') {
+            this.modelState = 'error';
             this.onModelState('error');
             this.cueCache.set(cue.id, { status: 'failed', voice });
           } else {
@@ -374,6 +413,7 @@ export class AudioScheduler {
           return null;
         }
 
+        this.modelState = 'ready';
         this.onModelState('ready');
         const arrayBuf = base64ToArrayBuffer(res.wavBase64);
         const audioBuffer = await ctx.decodeAudioData(arrayBuf);
@@ -390,6 +430,9 @@ export class AudioScheduler {
           durationSec: audioBuffer.duration || res.durationSec,
         };
         this.cueCache.set(cue.id, entry);
+        if (this.enabled && !this.adPaused) {
+          this.tick();
+        }
         return entry;
       } catch {
         if (this.cueCache.get(cue.id)?.voice === voice) {
@@ -407,7 +450,12 @@ export class AudioScheduler {
     const ctx = this._ensureAudioContext();
     const now = ctx.currentTime;
     const videoRate = this.video?.playbackRate || 1;
-    const ttsRate = calculateTtsPlaybackRate(audioBuffer.duration, cue.durationSec, videoRate);
+    const currentVideoTime = this.video?.currentTime ?? cue.startSec;
+    const remainingCueSec = Math.min(
+      cue.durationSec,
+      Math.max(0.35, cue.endSec - currentVideoTime)
+    );
+    const ttsRate = calculateTtsPlaybackRate(audioBuffer.duration, remainingCueSec, videoRate);
     const playbackDuration = audioBuffer.duration / ttsRate;
 
     let startAt = Math.max(now, this.nextAllowedAudioTime);
@@ -504,8 +552,15 @@ export class AudioScheduler {
       return;
     }
 
-    // Use Web Speech API fallback immediately while Kokoro weights download or synthesize first cue
-    this.playedCueIds.add(cue.id);
-    this._speakFallback(cue);
+    // Never fall back to system speechSynthesis while Kokoro is ready or synthesizing a pending cue
+    if (this.modelState === 'ready' && (!cached || cached.status === 'pending')) {
+      return;
+    }
+
+    // Use Web Speech API fallback only while Kokoro weights are downloading or on backend error
+    if (this.modelState === 'loading' || this.modelState === 'error' || cached?.status === 'failed') {
+      this.playedCueIds.add(cue.id);
+      this._speakFallback(cue);
+    }
   }
 }

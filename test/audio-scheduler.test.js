@@ -80,21 +80,24 @@ function createFakeAudioContext() {
   };
 }
 
-test('calculateTtsPlaybackRate scales with video speed and clamps to [0.85, 1.45]', () => {
+test('calculateTtsPlaybackRate keeps natural speed when audio fits window and gently caps speedup', () => {
   assert.equal(calculateTtsPlaybackRate(2.0, 2.0, 1.0), 1.0);
+  assert.equal(calculateTtsPlaybackRate(1.0, 2.0, 1.0), 1.0); // does not artificially slow down
+  assert.equal(calculateTtsPlaybackRate(2.3, 2.0, 1.0), 1.15); // gentle catch-up
+  assert.equal(calculateTtsPlaybackRate(4.0, 2.0, 1.0), 1.22); // capped at 1.22x at 1x speed
   assert.equal(calculateTtsPlaybackRate(2.0, 2.0, 1.25), 1.25);
-  assert.equal(calculateTtsPlaybackRate(2.0, 2.0, 1.5), 1.45); // clamped max
-  assert.equal(calculateTtsPlaybackRate(2.0, 2.0, 2.0), 1.45); // clamped max
-  assert.equal(calculateTtsPlaybackRate(1.0, 2.0, 1.0), 0.85); // clamped min (0.5 -> 0.85)
+  assert.equal(calculateTtsPlaybackRate(2.0, 2.0, 1.5), 1.45);
+  assert.equal(calculateTtsPlaybackRate(2.0, 2.0, 2.0), 1.45);
 });
 
 test('AudioScheduler delays overlapping subsequent cue by 50ms', async () => {
-  const video = createFakeVideo(0.5, 1.0);
+  const video = createFakeVideo(0, 1.0);
   const audioCtx = createFakeAudioContext();
   const dummyBase64 = Buffer.from('RIFFtest').toString('base64');
 
   const scheduler = new AudioScheduler({
     video,
+    initialModelState: 'ready',
     createAudioContext: () => audioCtx,
     speechSynthesis: null,
     synthesizeCue: async () => ({
@@ -111,10 +114,7 @@ test('AudioScheduler delays overlapping subsequent cue by 50ms', async () => {
   ]);
 
   scheduler.start();
-  // Let lookahead synthesis & decode settle
   await new Promise((r) => setTimeout(r, 20));
-  scheduler.playedCueIds.clear();
-  scheduler.tick();
 
   assert.equal(audioCtx.createdSources.length, 1);
   assert.equal(audioCtx.createdSources[0].startedAt, 10);
@@ -131,7 +131,50 @@ test('AudioScheduler delays overlapping subsequent cue by 50ms', async () => {
   scheduler.destroy();
 });
 
-test('AudioScheduler falls back to speechSynthesis while Kokoro loads, then cancels on seek', async () => {
+test('AudioScheduler waits for pending Kokoro synthesis instead of using speechSynthesis when model is ready', async () => {
+  const video = createFakeVideo(0.1, 1.0);
+  const audioCtx = createFakeAudioContext();
+  const dummyBase64 = Buffer.from('RIFFtest').toString('base64');
+  const spoken = [];
+
+  const scheduler = new AudioScheduler({
+    video,
+    initialModelState: 'ready',
+    createAudioContext: () => audioCtx,
+    speechSynthesis: {
+      speak(u) {
+        spoken.push(u.text);
+      },
+      cancel() {},
+      pause() {},
+      resume() {},
+    },
+    synthesizeCue: async () => {
+      await new Promise((r) => setTimeout(r, 15));
+      return {
+        ok: true,
+        status: 'ready',
+        wavBase64: dummyBase64,
+        durationSec: 2.0,
+      };
+    },
+  });
+
+  scheduler.setCues([{ id: 0, text: 'Kokoro only', startSec: 0, endSec: 3, durationSec: 3 }]);
+  scheduler.start();
+
+  // Immediately after start(), synthesis is still pending: speechSynthesis must NOT fire
+  assert.deepEqual(spoken, []);
+
+  // Once Kokoro finishes, AudioBuffer plays automatically via tick()
+  await new Promise((r) => setTimeout(r, 35));
+  assert.deepEqual(spoken, []);
+  assert.equal(audioCtx.createdSources.length, 1);
+
+  scheduler.destroy();
+});
+
+test('AudioScheduler falls back to speechSynthesis only while Kokoro loads/errors, then cancels on seek', async () => {
   const video = createFakeVideo(0.2, 1.0);
   const audioCtx = createFakeAudioContext();
   const spoken = [];
@@ -140,6 +183,7 @@ test('AudioScheduler falls back to speechSynthesis while Kokoro loads, then canc
 
   const scheduler = new AudioScheduler({
     video,
+    initialModelState: 'loading',
     createAudioContext: () => audioCtx,
     cancelEpoch: (ep) => canceledEpochs.push(ep),
     speechSynthesis: {
@@ -177,34 +221,47 @@ test('AudioScheduler falls back to speechSynthesis while Kokoro loads, then canc
   scheduler.destroy();
 });
 
-test('AudioScheduler updates playbackRate on ratechange and suspends on pause', async () => {
-  const video = createFakeVideo(0.5, 1.0);
+test('AudioScheduler switches Kokoro voice immediately via setVoice and updates rate on ratechange', async () => {
+  const video = createFakeVideo(0, 1.0);
   const audioCtx = createFakeAudioContext();
   const dummyBase64 = Buffer.from('RIFFtest').toString('base64');
+  let activeVoice = 'af_heart';
+  const requestedVoices = [];
 
   const scheduler = new AudioScheduler({
     video,
+    initialModelState: 'ready',
+    getVoice: () => activeVoice,
     createAudioContext: () => audioCtx,
     speechSynthesis: null,
-    synthesizeCue: async () => ({
-      ok: true,
-      status: 'ready',
-      wavBase64: dummyBase64,
-      durationSec: 2.0,
-    }),
+    synthesizeCue: async ({ voice }) => {
+      requestedVoices.push(voice);
+      return {
+        ok: true,
+        status: 'ready',
+        wavBase64: dummyBase64,
+        durationSec: 2.0,
+      };
+    },
   });
 
   scheduler.setCues([{ id: 0, text: 'Rate test', startSec: 0, endSec: 2.0, durationSec: 2.0 }]);
   scheduler.start();
   await new Promise((r) => setTimeout(r, 20));
-  scheduler.playedCueIds.clear();
-  scheduler.tick();
 
+  assert.equal(audioCtx.createdSources.length, 1);
   assert.equal(audioCtx.createdSources[0].playbackRate.value, 1.0);
 
   video.playbackRate = 1.25;
   video.emit('ratechange');
   assert.equal(audioCtx.createdSources[0].playbackRate.value, 1.25);
+
+  activeVoice = 'bm_george';
+  scheduler.setVoice('bm_george');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(audioCtx.createdSources[0].stopped, true);
+  assert.equal(audioCtx.createdSources.length, 2);
+  assert.ok(requestedVoices.includes('bm_george'));
 
   video.emit('pause');
   assert.equal(audioCtx.suspendedCount, 1);

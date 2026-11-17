@@ -53,10 +53,34 @@ function copyOnnxWasmAssets() {
   }
 }
 
+function copyKokoroVoices() {
+  const voicesDestDir = path.join(distDir, 'voices');
+  fs.mkdirSync(voicesDestDir, { recursive: true });
+  const voicesSrcDir = path.join(rootDir, 'node_modules/kokoro-js/voices');
+  const presets = [
+    'af_heart.bin',
+    'af_bella.bin',
+    'am_adam.bin',
+    'am_michael.bin',
+    'bf_emma.bin',
+    'bm_george.bin',
+  ];
+
+  for (const fileName of presets) {
+    const srcPath = path.join(voicesSrcDir, fileName);
+    if (fs.existsSync(srcPath)) {
+      fs.copyFileSync(srcPath, path.join(voicesDestDir, fileName));
+    } else {
+      console.warn(`[build] Missing Kokoro voice asset: ${fileName}`);
+    }
+  }
+}
+
 function copyStaticAssets() {
   fs.mkdirSync(distDir, { recursive: true });
   copyDirRecursive(publicDir, distDir);
   copyOnnxWasmAssets();
+  copyKokoroVoices();
 }
 
 const kokoroWebPlugin = {

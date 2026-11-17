@@ -1,6 +1,30 @@
 import { KokoroTTS, env } from 'kokoro-js';
 
 const MODEL_ID = 'onnx-community/Kokoro-82M-v1.0-ONNX';
+const BUNDLED_VOICES = new Set([
+  'af_heart.bin',
+  'af_bella.bin',
+  'am_adam.bin',
+  'am_michael.bin',
+  'bf_emma.bin',
+  'bm_george.bin',
+]);
+
+// Serve bundled voice embeddings locally before hitting Hugging Face Hub
+const rawFetch = globalThis.fetch.bind(globalThis);
+globalThis.fetch = async (input, init) => {
+  const url = typeof input === 'string' ? input : input?.url || '';
+  const match = url.match(/\/voices\/([a-z0-9_]+\.bin)(?:\?.*)?$/i);
+  if (match && BUNDLED_VOICES.has(match[1])) {
+    try {
+      const localRes = await rawFetch(chrome.runtime.getURL(`voices/${match[1]}`));
+      if (localRes.ok) return localRes;
+    } catch {
+      // Fall back to network fetch if local asset lookup fails
+    }
+  }
+  return rawFetch(input, init);
+};
 
 // Ensure ONNX Runtime Web loads WASM and worker modules from extension bundle (MV3 CSP compliant)
 env.wasmPaths = chrome.runtime.getURL('wasm/');
@@ -82,7 +106,7 @@ async function detectWebGpuAvailable() {
 }
 
 async function loadModelWithDevice(device) {
-  return KokoroTTS.from_pretrained(MODEL_ID, {
+  const tts = await KokoroTTS.from_pretrained(MODEL_ID, {
     dtype: 'q8',
     device,
     progress_callback: (info) => {
@@ -92,6 +116,13 @@ async function loadModelWithDevice(device) {
       }
     },
   });
+
+  // Smoke-test actual inference before reporting Ready (catches WebGPU q8 kernel failures)
+  const testAudio = await tts.generate('Hi', { voice: 'af_heart' });
+  if (!testAudio?.audio?.length || Number.isNaN(testAudio.audio[0])) {
+    throw new Error(`Invalid audio output from ${device} backend`);
+  }
+  return tts;
 }
 
 async function ensureKokoroReady() {
@@ -165,7 +196,20 @@ function enqueueSynthesis({ text, voice, epoch }) {
     }
 
     const selectedVoice = voice || 'af_heart';
-    const rawAudio = await ttsInstance.generate(cleanText, { voice: selectedVoice });
+    let rawAudio;
+    try {
+      rawAudio = await ttsInstance.generate(cleanText, { voice: selectedVoice });
+    } catch (err) {
+      if (activeDevice === 'webgpu') {
+        console.warn('[ClearVoice] WebGPU inference failed, switching to WASM:', err);
+        ttsInstance = await loadModelWithDevice('wasm');
+        activeDevice = 'wasm';
+        broadcastStatus();
+        rawAudio = await ttsInstance.generate(cleanText, { voice: selectedVoice });
+      } else {
+        throw err;
+      }
+    }
 
     if (typeof epoch === 'number' && epoch < cancelledEpoch) {
       return { ok: false, status: 'cancelled' };

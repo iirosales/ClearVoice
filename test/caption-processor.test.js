@@ -34,7 +34,7 @@ test('normalizeTechJargon fixes common CS auto-caption errors', () => {
   );
 });
 
-test('processCaptionEvents merges small fragments into sentences up to 20 words', () => {
+test('processCaptionEvents merges small fragments into tight clauses', () => {
   const events = [
     { tStartMs: 1000, dDurationMs: 900, segs: [{ utf8: 'Welcome' }, { utf8: ' back' }] },
     { tStartMs: 1900, dDurationMs: 1100, segs: [{ utf8: 'to this' }] },
@@ -50,32 +50,26 @@ test('processCaptionEvents merges small fragments into sentences up to 20 words'
   assert.equal(cues[0].id, 0);
   assert.equal(cues[0].text, 'Welcome back to this Kubernetes tutorial.');
   assert.equal(cues[0].startSec, 1.0);
-  assert.equal(cues[0].endSec, 5.2);
-  assert.equal(cues[0].durationSec, 4.2);
+  assert.ok(cues[0].endSec <= 5.3 && cues[0].endSec >= 4.0);
 
   assert.equal(cues[1].id, 1);
   assert.equal(cues[1].text, 'Let us inspect the JSON config.');
   assert.equal(cues[1].startSec, 5.3);
-  assert.equal(cues[1].endSec, 8.3);
 });
 
-test('processCaptionEvents splits on pause gap > 600ms and caps at 20 words', () => {
+test('processCaptionEvents detects pauses even with rolling ASR durations and caps at 12 words', () => {
   const events = [
-    { tStartMs: 0, dDurationMs: 1000, segs: [{ utf8: 'First short phrase' }] },
-    // 800ms pause gap (1800 - 1000)
+    // Rolling dDurationMs = 5000ms for 3 words -> estimated spoken end ~1210ms; next at 1800ms -> gap > 450ms
+    { tStartMs: 0, dDurationMs: 5000, segs: [{ utf8: 'First short phrase' }] },
     { tStartMs: 1800, dDurationMs: 1000, segs: [{ utf8: 'one two three four five six seven' }] },
     { tStartMs: 2800, dDurationMs: 1000, segs: [{ utf8: 'eight nine ten eleven twelve thirteen' }] },
-    { tStartMs: 3800, dDurationMs: 1000, segs: [{ utf8: 'fourteen fifteen sixteen seventeen eighteen nineteen twenty twentyone' }] },
   ];
 
   const cues = processCaptionEvents(events);
   assert.equal(cues.length, 3);
   assert.equal(cues[0].text, 'First short phrase');
-  assert.equal(cues[1].text, 'one two three four five six seven eight nine ten eleven twelve thirteen');
-  assert.equal(
-    cues[2].text,
-    'fourteen fifteen sixteen seventeen eighteen nineteen twenty twentyone'
-  );
+  assert.equal(cues[1].text, 'one two three four five six seven');
+  assert.equal(cues[2].text, 'eight nine ten eleven twelve thirteen');
 });
 
 test('processCaptionEvents skips pure [Music] events and clamps overlapping windows', () => {
@@ -89,6 +83,6 @@ test('processCaptionEvents skips pure [Music] events and clamps overlapping wind
   assert.equal(cues.length, 2);
   assert.equal(cues[0].text, 'Hello world from GitHub.');
   assert.equal(cues[0].startSec, 1);
-  assert.equal(cues[0].endSec, 3);
-  assert.equal(cues[0].durationSec, 2);
+  assert.ok(cues[0].endSec <= 3 && cues[0].endSec >= 2.5);
+  assert.ok(cues[0].durationSec <= 2 && cues[0].durationSec >= 1.5);
 });

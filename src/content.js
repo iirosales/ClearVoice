@@ -21,6 +21,28 @@ import { UIInjector } from './ui-injector.js';
   let observedPlayer = null;
   let playerObserver = null;
   let lastUrl = window.location.href;
+  let captionRetryCount = 0;
+  let captionRetryTimer = null;
+
+  function clearCaptionRetries() {
+    if (captionRetryTimer !== null) {
+      clearTimeout(captionRetryTimer);
+      captionRetryTimer = null;
+    }
+  }
+
+  function scheduleCaptionRetry() {
+    clearCaptionRetries();
+    if (!currentVideoId || transcriptAvailable || captionRetryCount >= 2) return;
+    const delayMs = captionRetryCount === 0 ? 1200 : 2000;
+    captionRetryCount += 1;
+    captionRetryTimer = setTimeout(() => {
+      captionRetryTimer = null;
+      if (!transcriptAvailable && getVideoIdFromLocation() === currentVideoId) {
+        requestCaptionsFromBridge(true);
+      }
+    }, delayMs);
+  }
 
   function getVideoIdFromLocation() {
     const url = new URL(window.location.href);
@@ -77,6 +99,7 @@ import { UIInjector } from './ui-injector.js';
     },
     onModelState: (state) => {
       modelState = state;
+      scheduler.setModelState(state);
       updateUiButtonState();
     },
   });
@@ -101,12 +124,14 @@ import { UIInjector } from './ui-injector.js';
   function ensureModelWarmup() {
     if (modelState === 'ready' || modelState === 'loading') return;
     modelState = 'loading';
+    scheduler.setModelState('loading');
     updateUiButtonState();
     chrome.runtime
       .sendMessage({ target: 'background', type: 'CV_INIT_MODEL' })
       .then((res) => {
         if (res?.modelState) {
           modelState = res.modelState;
+          scheduler.setModelState(modelState);
           updateUiButtonState();
         }
       })
@@ -211,6 +236,8 @@ import { UIInjector } from './ui-injector.js';
   }
 
   function handleVideoChange() {
+    clearCaptionRetries();
+    captionRetryCount = 0;
     const nextVideoId = getVideoIdFromLocation();
     currentVideoId = nextVideoId;
     transcriptAvailable = false;
@@ -245,6 +272,7 @@ import { UIInjector } from './ui-injector.js';
       cues = [];
       scheduler.setCues([]);
       applyPlaybackState();
+      scheduleCaptionRetry();
       return;
     }
 
@@ -254,9 +282,11 @@ import { UIInjector } from './ui-injector.js';
       cues = [];
       scheduler.setCues([]);
       applyPlaybackState();
+      scheduleCaptionRetry();
       return;
     }
 
+    clearCaptionRetries();
     transcriptAvailable = true;
     cues = processed;
     scheduler.setCues(processed);
@@ -267,6 +297,7 @@ import { UIInjector } from './ui-injector.js';
     if (!message || message.target !== 'content') return false;
     if (message.type === 'CV_STATUS_CHANGED' && message.modelState) {
       modelState = message.modelState;
+      scheduler.setModelState(modelState);
       updateUiButtonState();
     }
     return false;
@@ -281,7 +312,7 @@ import { UIInjector } from './ui-injector.js';
     }
     if (changes.voice && changes.voice.newValue !== prefs.voice) {
       prefs.voice = changes.voice.newValue || 'af_heart';
-      scheduler.invalidateVoiceCache();
+      scheduler.setVoice(prefs.voice);
       shouldApply = true;
     }
     if (shouldApply) {
@@ -339,6 +370,7 @@ import { UIInjector } from './ui-injector.js';
       });
       if (status?.modelState) {
         modelState = status.modelState;
+        scheduler.setModelState(modelState);
       }
     } catch {
       // Background worker starts on demand

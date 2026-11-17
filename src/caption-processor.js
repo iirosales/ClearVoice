@@ -31,11 +31,11 @@ const TECH_JARGON_RULES = [
   [/\bdocker\s+file\b/gi, 'Dockerfile'],
 ];
 
-const PAUSE_SPLIT_MS = 600;
-const MIN_WORDS_FOR_PUNCT_SPLIT = 4;
-const CLAUSE_SPLIT_WORD_THRESHOLD = 14;
-const MAX_WORDS_PER_CUE = 20;
-const MIN_CUE_DURATION_SEC = 0.35;
+const PAUSE_SPLIT_MS = 450;
+const MIN_WORDS_FOR_PUNCT_SPLIT = 3;
+const CLAUSE_SPLIT_WORD_THRESHOLD = 7;
+const MAX_WORDS_PER_CUE = 12;
+const MIN_CUE_DURATION_SEC = 0.4;
 const ABBREVIATION_END_RE = /\b(?:mr|mrs|ms|dr|prof|sr|jr|vs|etc|e\.g|i\.e|fig|no)\.\s*$/i;
 
 /**
@@ -119,38 +119,59 @@ function extractEventText(event) {
 export function processCaptionEvents(events) {
   if (!Array.isArray(events) || events.length === 0) return [];
 
-  // Step 1: Extract valid timed speech events
+  // Step 1: Extract valid timed speech events using segment offsets to estimate true spoken ends
   const validEvents = [];
   for (const ev of events) {
     if (typeof ev?.tStartMs !== 'number' || ev.tStartMs < 0) continue;
     const text = extractEventText(ev);
     if (!text) continue;
 
+    let firstOffsetMs = 0;
+    let lastOffsetMs = 0;
+    for (const seg of ev.segs) {
+      if (typeof seg?.tOffsetMs === 'number' && seg.tOffsetMs >= 0) {
+        if (firstOffsetMs === 0 && seg.tOffsetMs > 0) {
+          firstOffsetMs = seg.tOffsetMs;
+        }
+        lastOffsetMs = Math.max(lastOffsetMs, seg.tOffsetMs);
+      }
+    }
+
+    const startMs = ev.tStartMs + firstOffsetMs;
     const rawDurationMs =
       typeof ev.dDurationMs === 'number' && ev.dDurationMs > 0 ? ev.dDurationMs : 2000;
+    const rawEndMs = ev.tStartMs + rawDurationMs;
+    const wordCount = countWords(text);
+    const estimatedSpeechMs = Math.max(400, wordCount * 320);
+
+    // YouTube auto-captions set dDurationMs to rolling display window (~4-5s), not spoken length
+    const spokenEndMs =
+      lastOffsetMs > 0
+        ? ev.tStartMs + lastOffsetMs + 350
+        : Math.min(rawEndMs, startMs + estimatedSpeechMs + 250);
 
     validEvents.push({
       text,
-      startMs: ev.tStartMs,
-      endMs: ev.tStartMs + rawDurationMs,
+      startMs,
+      spokenEndMs,
+      wordCount,
     });
   }
 
   if (validEvents.length === 0) return [];
 
-  // Step 2: Merge consecutive fragments into sentence/clause cues (8-20 words target)
+  // Step 2: Merge consecutive fragments into crisp 6-12 word sentence/clause cues
   const rawCues = [];
   let current = {
     textParts: [validEvents[0].text],
     startMs: validEvents[0].startMs,
-    endMs: validEvents[0].endMs,
-    wordCount: countWords(validEvents[0].text),
+    spokenEndMs: validEvents[0].spokenEndMs,
+    wordCount: validEvents[0].wordCount,
   };
 
   for (let i = 1; i < validEvents.length; i++) {
     const ev = validEvents[i];
-    const evWords = countWords(ev.text);
-    const gapMs = ev.startMs - current.endMs;
+    const gapMs = ev.startMs - current.spokenEndMs;
     const currentText = current.textParts.join(' ');
 
     const hasTerminal = endsWithTerminalPunctuation(currentText);
@@ -159,48 +180,54 @@ export function processCaptionEvents(events) {
     const shouldSplit =
       gapMs > PAUSE_SPLIT_MS ||
       (hasTerminal && current.wordCount >= MIN_WORDS_FOR_PUNCT_SPLIT) ||
-      current.wordCount + evWords > MAX_WORDS_PER_CUE ||
+      current.wordCount + ev.wordCount > MAX_WORDS_PER_CUE ||
       (hasClause && current.wordCount >= CLAUSE_SPLIT_WORD_THRESHOLD);
 
     if (shouldSplit) {
       rawCues.push({
         text: normalizeTechJargon(currentText),
         startMs: current.startMs,
-        endMs: current.endMs,
+        spokenEndMs: current.spokenEndMs,
       });
       current = {
         textParts: [ev.text],
         startMs: ev.startMs,
-        endMs: ev.endMs,
-        wordCount: evWords,
+        spokenEndMs: ev.spokenEndMs,
+        wordCount: ev.wordCount,
       };
     } else {
       current.textParts.push(ev.text);
-      current.endMs = Math.max(current.endMs, ev.endMs);
-      current.wordCount += evWords;
+      current.spokenEndMs = Math.max(current.spokenEndMs, ev.spokenEndMs);
+      current.wordCount += ev.wordCount;
     }
   }
 
   rawCues.push({
     text: normalizeTechJargon(current.textParts.join(' ')),
     startMs: current.startMs,
-    endMs: current.endMs,
+    spokenEndMs: current.spokenEndMs,
   });
 
-  // Step 3: Compute clean non-overlapping seconds timestamps
+  // Step 3: Compute clean non-overlapping seconds timestamps without artificially tight windows
   const finalCues = [];
   for (let i = 0; i < rawCues.length; i++) {
     const cue = rawCues[i];
     const cleanedText = cue.text.replace(/\s+/g, ' ').trim();
     if (!cleanedText) continue;
 
+    const cueWordCount = countWords(cleanedText);
     const startSec = cue.startMs / 1000;
-    let endSec = cue.endMs / 1000;
+    const rawEndSec = Math.max(
+      cue.spokenEndMs / 1000,
+      startSec + Math.max(0.6, cueWordCount * 0.34)
+    );
+    let endSec = rawEndSec;
 
     if (i + 1 < rawCues.length) {
       const nextStartSec = rawCues[i + 1].startMs / 1000;
       if (nextStartSec > startSec) {
-        endSec = Math.min(endSec, nextStartSec);
+        const naturalWindowEnd = Math.min(nextStartSec - 0.05, startSec + cueWordCount * 0.42);
+        endSec = Math.min(nextStartSec, Math.max(rawEndSec, naturalWindowEnd));
       }
     }
 
