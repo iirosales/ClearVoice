@@ -32,11 +32,11 @@ const TECH_JARGON_RULES = [
 ];
 
 const PAUSE_SPLIT_MS = 600;
-const SOFT_PUNCT_PAUSE_MS = 250;
-const MIN_WORDS_FOR_PUNCT_SPLIT = 6;
+const MIN_WORDS_FOR_PUNCT_SPLIT = 4;
 const CLAUSE_SPLIT_WORD_THRESHOLD = 14;
 const MAX_WORDS_PER_CUE = 20;
 const MIN_CUE_DURATION_SEC = 0.35;
+const ABBREVIATION_END_RE = /\b(?:mr|mrs|ms|dr|prof|sr|jr|vs|etc|e\.g|i\.e|fig|no)\.\s*$/i;
 
 /**
  * Decode common named and numeric HTML entities found in YouTube caption segments.
@@ -93,7 +93,10 @@ function countWords(text) {
 }
 
 function endsWithTerminalPunctuation(text) {
-  return /[.!?]["')\]]*$/.test(text.trim());
+  const trimmed = text.trim();
+  if (!/[.!?]["')\]]*$/.test(trimmed)) return false;
+  if (/\.\.\.["')\]]*$/.test(trimmed)) return false;
+  return !ABBREVIATION_END_RE.test(trimmed);
 }
 
 function endsWithClausePunctuation(text) {
@@ -155,7 +158,7 @@ export function processCaptionEvents(events) {
 
     const shouldSplit =
       gapMs > PAUSE_SPLIT_MS ||
-      (hasTerminal && (current.wordCount >= MIN_WORDS_FOR_PUNCT_SPLIT || gapMs > SOFT_PUNCT_PAUSE_MS)) ||
+      (hasTerminal && current.wordCount >= MIN_WORDS_FOR_PUNCT_SPLIT) ||
       current.wordCount + evWords > MAX_WORDS_PER_CUE ||
       (hasClause && current.wordCount >= CLAUSE_SPLIT_WORD_THRESHOLD);
 
