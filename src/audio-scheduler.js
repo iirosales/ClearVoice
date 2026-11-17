@@ -1,0 +1,511 @@
+const MIN_TTS_RATE = 0.85;
+const MAX_TTS_RATE = 1.45;
+const LOOKAHEAD_CUES = 4;
+const OVERLAP_GAP_SEC = 0.05;
+const MAX_WAIT_FOR_ACTIVE_SEC = 0.75;
+const TICK_INTERVAL_MS = 100;
+
+/**
+ * Compute clamped TTS playbackRate so an audio buffer fits the cue window
+ * while respecting YouTube's video.playbackRate.
+ */
+export function calculateTtsPlaybackRate(audioDurationSec, cueDurationSec, videoPlaybackRate = 1) {
+  if (!Number.isFinite(audioDurationSec) || audioDurationSec <= 0) return 1;
+  if (!Number.isFinite(cueDurationSec) || cueDurationSec <= 0) return 1;
+
+  const safeVideoRate =
+    Number.isFinite(videoPlaybackRate) && videoPlaybackRate > 0 ? videoPlaybackRate : 1;
+  const effectiveWindow = cueDurationSec / safeVideoRate;
+  if (effectiveWindow <= 0) return MAX_TTS_RATE;
+
+  const rawRate = audioDurationSec / effectiveWindow;
+  return Math.min(MAX_TTS_RATE, Math.max(MIN_TTS_RATE, rawRate));
+}
+
+export function base64ToArrayBuffer(base64) {
+  if (typeof atob === 'function') {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes.buffer;
+  }
+  return Uint8Array.from(Buffer.from(base64, 'base64')).buffer;
+}
+
+export class AudioScheduler {
+  constructor(options = {}) {
+    this.video = options.video || null;
+    this.synthesizeCue = options.synthesizeCue;
+    this.cancelEpoch = options.cancelEpoch || (() => {});
+    this.getVoice = options.getVoice || (() => 'af_heart');
+    this.onModelState = options.onModelState || (() => {});
+    this.createAudioContext =
+      options.createAudioContext ||
+      (() => {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        return new Ctx();
+      });
+    this.speechSynthesis =
+      options.speechSynthesis !== undefined
+        ? options.speechSynthesis
+        : typeof window !== 'undefined'
+          ? window.speechSynthesis
+          : null;
+    this.createUtterance =
+      options.createUtterance ||
+      ((text) =>
+        typeof SpeechSynthesisUtterance !== 'undefined'
+          ? new SpeechSynthesisUtterance(text)
+          : { text, rate: 1 });
+
+    this.audioCtx = null;
+    this.cues = [];
+    this.cueCache = new Map();
+    this.playedCueIds = new Set();
+    this.activePlayback = null;
+    this.scheduledFallbackId = null;
+    this.nextAllowedAudioTime = 0;
+
+    this.epoch = 0;
+    this.enabled = false;
+    this.adPaused = false;
+    this.tickTimer = null;
+
+    this._boundHandlers = null;
+    if (this.video) {
+      this.attachVideo(this.video);
+    }
+  }
+
+  attachVideo(video) {
+    if (this.video && this._boundHandlers) {
+      this._detachVideoListeners(this.video);
+    }
+    this.video = video;
+    if (!video) return;
+
+    this._boundHandlers = {
+      play: () => this._handlePlay(),
+      playing: () => this._handlePlay(),
+      pause: () => this._handlePause(),
+      waiting: () => this._handlePause(),
+      seeking: () => this.handleSeek(),
+      seeked: () => this.tick(),
+      ratechange: () => this._handleRateChange(),
+      timeupdate: () => this.tick(),
+    };
+
+    for (const [event, fn] of Object.entries(this._boundHandlers)) {
+      video.addEventListener(event, fn);
+    }
+  }
+
+  _detachVideoListeners(video) {
+    if (!video || !this._boundHandlers) return;
+    for (const [event, fn] of Object.entries(this._boundHandlers)) {
+      video.removeEventListener(event, fn);
+    }
+    this._boundHandlers = null;
+  }
+
+  _ensureAudioContext() {
+    if (!this.audioCtx) {
+      this.audioCtx = this.createAudioContext();
+    }
+    if (this.audioCtx.state === 'suspended' && this.enabled && !this.adPaused && !this.video?.paused) {
+      this.audioCtx.resume().catch(() => {});
+    }
+    return this.audioCtx;
+  }
+
+  setCues(cues) {
+    this.stopActiveAudio();
+    this.epoch += 1;
+    this.cancelEpoch(this.epoch);
+    this.cues = Array.isArray(cues) ? cues : [];
+    this.cueCache.clear();
+    this.playedCueIds.clear();
+    this.nextAllowedAudioTime = 0;
+    if (this.enabled && !this.adPaused) {
+      this.tick();
+    }
+  }
+
+  start() {
+    this.enabled = true;
+    this._ensureAudioContext();
+    if (!this.tickTimer) {
+      this.tickTimer = setInterval(() => this.tick(), TICK_INTERVAL_MS);
+    }
+    if (!this.adPaused) {
+      if (this.video && !this.video.paused) {
+        this.audioCtx?.resume?.().catch(() => {});
+      }
+      this.tick();
+    }
+  }
+
+  stop() {
+    this.enabled = false;
+    if (this.tickTimer) {
+      clearInterval(this.tickTimer);
+      this.tickTimer = null;
+    }
+    this.epoch += 1;
+    this.cancelEpoch(this.epoch);
+    this.stopActiveAudio();
+    this.playedCueIds.clear();
+    this.nextAllowedAudioTime = 0;
+    if (this.audioCtx && this.audioCtx.state === 'running') {
+      this.audioCtx.suspend().catch(() => {});
+    }
+  }
+
+  setAdPlaying(isAd) {
+    const next = Boolean(isAd);
+    if (this.adPaused === next) return;
+    this.adPaused = next;
+
+    if (next) {
+      this.stopActiveAudio();
+      if (this.audioCtx && this.audioCtx.state === 'running') {
+        this.audioCtx.suspend().catch(() => {});
+      }
+    } else if (this.enabled) {
+      if (this.video && !this.video.paused) {
+        this.audioCtx?.resume?.().catch(() => {});
+      }
+      this.playedCueIds.clear();
+      this.tick();
+    }
+  }
+
+  invalidateVoiceCache() {
+    this.epoch += 1;
+    this.cancelEpoch(this.epoch);
+    this.cueCache.clear();
+    if (this.enabled && !this.adPaused) {
+      this.tick();
+    }
+  }
+
+  destroy() {
+    this.stop();
+    if (this.video) {
+      this._detachVideoListeners(this.video);
+      this.video = null;
+    }
+    if (this.audioCtx && typeof this.audioCtx.close === 'function') {
+      this.audioCtx.close().catch(() => {});
+      this.audioCtx = null;
+    }
+  }
+
+  stopActiveAudio() {
+    if (this.activePlayback) {
+      const { sourceNode } = this.activePlayback;
+      this.activePlayback = null;
+      try {
+        sourceNode.onended = null;
+        sourceNode.stop();
+        sourceNode.disconnect();
+      } catch {
+        // Node may have already stopped
+      }
+    }
+
+    if (this.scheduledFallbackId !== null) {
+      this.scheduledFallbackId = null;
+    }
+    if (this.speechSynthesis && typeof this.speechSynthesis.cancel === 'function') {
+      this.speechSynthesis.cancel();
+    }
+  }
+
+  handleSeek() {
+    this.epoch += 1;
+    this.stopActiveAudio();
+    this.playedCueIds.clear();
+    this.nextAllowedAudioTime = 0;
+
+    // Remove pending synthesis tasks while keeping already-decoded AudioBuffers
+    for (const [cueId, entry] of this.cueCache.entries()) {
+      if (entry.status === 'pending' || entry.status === 'failed') {
+        this.cueCache.delete(cueId);
+      }
+    }
+
+    this.cancelEpoch(this.epoch);
+    if (this.enabled && !this.adPaused) {
+      this.tick();
+    }
+  }
+
+  _handlePlay() {
+    if (!this.enabled || this.adPaused) return;
+    const ctx = this._ensureAudioContext();
+    if (ctx.state === 'suspended') {
+      ctx.resume().catch(() => {});
+    }
+    if (this.speechSynthesis && typeof this.speechSynthesis.resume === 'function') {
+      this.speechSynthesis.resume();
+    }
+    this.tick();
+  }
+
+  _handlePause() {
+    if (this.audioCtx && this.audioCtx.state === 'running') {
+      this.audioCtx.suspend().catch(() => {});
+    }
+    if (this.speechSynthesis && typeof this.speechSynthesis.pause === 'function') {
+      this.speechSynthesis.pause();
+    }
+  }
+
+  _handleRateChange() {
+    if (!this.activePlayback || !this.video) return;
+    const { sourceNode, audioDurationSec, cueDurationSec } = this.activePlayback;
+    const newRate = calculateTtsPlaybackRate(
+      audioDurationSec,
+      cueDurationSec,
+      this.video.playbackRate || 1
+    );
+    if (sourceNode?.playbackRate) {
+      sourceNode.playbackRate.value = newRate;
+    }
+  }
+
+  findCueIndexAtTime(currentTimeSec) {
+    if (this.cues.length === 0) return -1;
+    // Binary search for latest cue with startSec <= currentTimeSec
+    let low = 0;
+    let high = this.cues.length - 1;
+    let candidate = -1;
+
+    while (low <= high) {
+      const mid = (low + high) >> 1;
+      if (this.cues[mid].startSec <= currentTimeSec) {
+        candidate = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+
+    if (candidate !== -1 && currentTimeSec < this.cues[candidate].endSec) {
+      return candidate;
+    }
+    return -1;
+  }
+
+  findNextCueIndex(currentTimeSec) {
+    let low = 0;
+    let high = this.cues.length - 1;
+    let result = this.cues.length;
+
+    while (low <= high) {
+      const mid = (low + high) >> 1;
+      if (this.cues[mid].startSec >= currentTimeSec) {
+        result = mid;
+        high = mid - 1;
+      } else {
+        low = mid + 1;
+      }
+    }
+    return result;
+  }
+
+  prebufferLookahead(currentTimeSec) {
+    if (!this.enabled || this.adPaused || this.cues.length === 0) return;
+
+    const activeIdx = this.findCueIndexAtTime(currentTimeSec);
+    const startIdx = activeIdx !== -1 ? activeIdx : this.findNextCueIndex(currentTimeSec);
+    const endIdx = Math.min(this.cues.length, startIdx + LOOKAHEAD_CUES);
+
+    for (let i = startIdx; i < endIdx; i++) {
+      this._ensureCueSynthesized(this.cues[i]);
+    }
+
+    // Evict stale buffers far behind playhead to keep memory bounded
+    for (const cueId of this.cueCache.keys()) {
+      if (cueId < startIdx - 6 || cueId > startIdx + LOOKAHEAD_CUES + 6) {
+        this.cueCache.delete(cueId);
+      }
+    }
+  }
+
+  async _ensureCueSynthesized(cue) {
+    if (!cue || !this.synthesizeCue) return null;
+    const voice = this.getVoice();
+    const existing = this.cueCache.get(cue.id);
+    if (existing && existing.voice === voice && (existing.status === 'ready' || existing.status === 'pending')) {
+      return existing.promise || existing;
+    }
+
+    const requestEpoch = this.epoch;
+    const ctx = this._ensureAudioContext();
+
+    const promise = (async () => {
+      try {
+        const res = await this.synthesizeCue({
+          text: cue.text,
+          voice,
+          epoch: requestEpoch,
+        });
+
+        if (requestEpoch !== this.epoch) {
+          this.cueCache.delete(cue.id);
+          return null;
+        }
+
+        if (!res || !res.ok) {
+          if (res?.status === 'loading') {
+            this.onModelState('loading');
+            // Do not permanently fail loading cues; allow retry on next lookahead
+            this.cueCache.delete(cue.id);
+          } else if (res?.status === 'error') {
+            this.onModelState('error');
+            this.cueCache.set(cue.id, { status: 'failed', voice });
+          } else {
+            this.cueCache.delete(cue.id);
+          }
+          return null;
+        }
+
+        this.onModelState('ready');
+        const arrayBuf = base64ToArrayBuffer(res.wavBase64);
+        const audioBuffer = await ctx.decodeAudioData(arrayBuf);
+
+        if (requestEpoch !== this.epoch) {
+          this.cueCache.delete(cue.id);
+          return null;
+        }
+
+        const entry = {
+          status: 'ready',
+          voice,
+          audioBuffer,
+          durationSec: audioBuffer.duration || res.durationSec,
+        };
+        this.cueCache.set(cue.id, entry);
+        return entry;
+      } catch {
+        if (this.cueCache.get(cue.id)?.voice === voice) {
+          this.cueCache.delete(cue.id);
+        }
+        return null;
+      }
+    })();
+
+    this.cueCache.set(cue.id, { status: 'pending', voice, promise });
+    return promise;
+  }
+
+  _scheduleAudioBuffer(cue, audioBuffer) {
+    const ctx = this._ensureAudioContext();
+    const now = ctx.currentTime;
+    const videoRate = this.video?.playbackRate || 1;
+    const ttsRate = calculateTtsPlaybackRate(audioBuffer.duration, cue.durationSec, videoRate);
+    const playbackDuration = audioBuffer.duration / ttsRate;
+
+    let startAt = Math.max(now, this.nextAllowedAudioTime);
+
+    if (this.activePlayback) {
+      const remaining = this.activePlayback.expectedEndAudioSec - now;
+      if (remaining > 0 && remaining <= MAX_WAIT_FOR_ACTIVE_SEC) {
+        // Delay slightly after previous cue ends rather than speaking simultaneously
+        startAt = Math.max(startAt, this.activePlayback.expectedEndAudioSec + OVERLAP_GAP_SEC);
+      } else {
+        this.stopActiveAudio();
+        startAt = Math.max(now + OVERLAP_GAP_SEC, this.nextAllowedAudioTime);
+      }
+    }
+
+    const sourceNode = ctx.createBufferSource();
+    sourceNode.buffer = audioBuffer;
+    sourceNode.playbackRate.value = ttsRate;
+    sourceNode.connect(ctx.destination);
+
+    const expectedEnd = startAt + playbackDuration;
+    this.nextAllowedAudioTime = expectedEnd + OVERLAP_GAP_SEC;
+
+    const playbackRecord = {
+      cueId: cue.id,
+      sourceNode,
+      startedAtAudioSec: startAt,
+      expectedEndAudioSec: expectedEnd,
+      audioDurationSec: audioBuffer.duration,
+      cueDurationSec: cue.durationSec,
+    };
+
+    sourceNode.onended = () => {
+      if (this.activePlayback === playbackRecord) {
+        this.activePlayback = null;
+        this.nextAllowedAudioTime = Math.max(
+          this.nextAllowedAudioTime,
+          ctx.currentTime + OVERLAP_GAP_SEC
+        );
+      }
+    };
+
+    this.activePlayback = playbackRecord;
+    sourceNode.start(startAt);
+  }
+
+  _speakFallback(cue) {
+    if (!this.speechSynthesis || typeof this.speechSynthesis.speak !== 'function') return;
+    if (this.scheduledFallbackId === cue.id) return;
+
+    this.speechSynthesis.cancel();
+    const utterance = this.createUtterance(cue.text);
+    const words = cue.text.split(/\s+/).filter(Boolean).length;
+    const estimatedSec = Math.max(0.5, words / 2.6);
+    utterance.rate = calculateTtsPlaybackRate(
+      estimatedSec,
+      cue.durationSec,
+      this.video?.playbackRate || 1
+    );
+
+    this.scheduledFallbackId = cue.id;
+    utterance.onend = () => {
+      if (this.scheduledFallbackId === cue.id) {
+        this.scheduledFallbackId = null;
+      }
+    };
+    this.speechSynthesis.speak(utterance);
+  }
+
+  tick() {
+    if (!this.enabled || this.adPaused || !this.video || this.cues.length === 0) return;
+
+    const currentTimeSec = this.video.currentTime || 0;
+    this.prebufferLookahead(currentTimeSec);
+
+    if (this.video.paused) return;
+
+    const cueIdx = this.findCueIndexAtTime(currentTimeSec);
+    if (cueIdx === -1) return;
+
+    const cue = this.cues[cueIdx];
+    if (this.playedCueIds.has(cue.id)) return;
+
+    const voice = this.getVoice();
+    const cached = this.cueCache.get(cue.id);
+
+    if (cached && cached.status === 'ready' && cached.voice === voice && cached.audioBuffer) {
+      this.playedCueIds.add(cue.id);
+      if (this.speechSynthesis && typeof this.speechSynthesis.cancel === 'function') {
+        this.speechSynthesis.cancel();
+        this.scheduledFallbackId = null;
+      }
+      this._scheduleAudioBuffer(cue, cached.audioBuffer);
+      return;
+    }
+
+    // Use Web Speech API fallback immediately while Kokoro weights download or synthesize first cue
+    this.playedCueIds.add(cue.id);
+    this._speakFallback(cue);
+  }
+}
